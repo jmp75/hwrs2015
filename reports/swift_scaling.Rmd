@@ -18,26 +18,38 @@ if(file.exists(thisPkgDir))
 
 # About this document
 
-This document was generated from an R markdown file on `r as.character(Sys.time())`.
+This document was generated from an R markdown file on `r as.character(Sys.time())`. The report is generated using:
 
+```{r, eval=FALSE, include=TRUE}
+library(knitr)
+setwd('F:/src/github_jm/hwrs2015/reports')
+knit2html('swift_scaling.Rmd')
+```
 # Methods
 
+The dimensions of the problem for which we want to assess how SWIFT scales are:
 * system size
 * number of time steps
-* number of input time series
-* number of output time series
 * level of parallel runs (multi-threading)
 
-```{r}
-cases <- expand.grid(so=1:4, years=c(2,5,10,20,30), threads=1:6)
-```
+A couple of other dimensions are of interest, but not elaborated on yet.
+* number of input time series
+* number of output time series
+
+You may want to only skim through the method section and go straight to the observations/results section at the end.
 
 ```{r}
 library(ophct)
-library(microbenchmark)
+library(calibragem)# just to use memory cleanup features.
+# library(microbenchmark) # not yet needed; may be later 
+# library(DiagrammeR)
 library(dplyr)
-library(DiagrammeR)
 ```
+# Methods - details
+
+## Test data
+
+First we use some sample data from the package, from the Ovens catchment. We extend the time series to a maximum of 60 years by recycling the data of a decade
 
 ```{r}
 simulStart <- '2000-01-01'
@@ -52,23 +64,31 @@ head(index(rain))
 
 extendTs <- function(tSeries) {
   d <- as.vector(tSeries)
-  d <- rep(d, 4)
+  d <- rep(d, 7)
   res <- xts(d, order.by=(index(tSeries)[1] + 3600*(0:(length(d)-1))))
-  return(res['2000-01-01/2029-12-31'])
+  return(res['2000-01-01/2059-12-31'])
 }
 
 rain <- extendTs(rain)
 evap <- extendTs(evap)
 flow <- extendTs(flow)
-
 ```
+
+## Functions
+
+This section declares the functions used to set up the models being benchmark. You do not need to read through it, and can skip to the section Observations
+
+We measure the runtime of catchment node-link networks idealised as a tree structure (structurally close to reality)
 
 ```{r}
 numLinks <- function(streamOrder=1) {
-  sum(2**(1:streamOrder))
+  # keeps numLinks vectorizable
+  if(length(streamOrder)==1) {
+	return(sum(2**(1:streamOrder)))
+  } else {
+	return(sapply( streamOrder, function(n) {sum(2**(1:n))} ))
+  }
 }
-
-nReps <- 10
 
 defineNetwork <- function(streamOrder=1, runoffModel='AWBM') {
 # o    o  o    o 
@@ -105,7 +125,11 @@ defineNetwork <- function(streamOrder=1, runoffModel='AWBM') {
   )
   defn
 }
+```
 
+Functions that build the test model structure, and set up the the simulation (inputs and simulation span)
+
+```{r}
 mkModelStructure <- function(defn) {
   createCatchment(
       defn$nodeIds, defn$nodeNames, 
@@ -121,12 +145,160 @@ mkModel <- function(streamOrder, tstep='hourly') {
   return(simulation)
 }
 
+mkTypical <- function(streamOrder, years=10, tstep='hourly') {
+  sim <- mkModel(streamOrder) 
+  sIds <- getSubareaIds(sim)
+  simulStart <- '2000-01-01'
+  simulEnd <- paste0(2000+years-1, '-12-31')
+  sSpan <- paste0('2000-01-01/',2000+years-1, '-12-31')
+  rain <- rain[sSpan]
+  evap <- evap[sSpan]
+  for (s in sIds) {
+	# Note that input time series are always fully copied for each subarea, so 
+	# this setup is faithfully mimicking a system with spatially varying inputs.
+    playSubareaInput(sim, input=rain, s, 'Rainfall')
+    playSubareaInput(sim, input=evap, s, 'Evapotranspiration')
+  }
+  setSimulationSpan(sim, start(rain), end(rain))
+  setSimulationTimeStep(sim, tstep)
+  recordState(sim, 'Catchment.StreamflowRate')
+  return(sim)
+}
+
+```
+
+Functions running the simulation. We use a C# binding layer to handle multi-threaded SWIFT test runs and nanosecond-level timing stopwatch. For our test case this would be cumbersome to do with R benchmarking packages.
+
+```{r}
+clrLoadAssembly('f:/src/github_jm/hwrs2015/ParallelSwift/bin/Debug/ParallelSwift.dll')
+
+runParallel <- function(simulation, nthreads=1L, reps=1L) {
+	return(clrCallStatic('ParallelSwift.SwiftRunTests', 'ParallelRun', simulation, nthreads, reps, -1L))
+}
+		
+runCase <- function(streamOrder, years=10L, nthreads=1L, reps=1L) {
+  s <- mkTypical(streamOrder, years)
+  runParallel(s, nthreads=nthreads, reps=reps)
+}
+
+runAndTag <- function(case, reps=10L) {
+  streamOrder <- as.integer(case$so)
+  years <- as.integer(case$years)
+  nthreads <- as.integer(case$threads)
+  rt <- runCase(streamOrder=streamOrder, years=years, nthreads=nthreads, reps=reps)
+  data.frame(deltaT=rt, streamOrder=rep(streamOrder, reps), nthreads=rep(nthreads, reps), years=rep(years, reps))
+}
+
+```
+
+# Observations
+
+We define a matrix of test cases, with factors being the stream order of the network, length of simulation in years, and number of systems to run in parallel, multi-threaded.
+
+```{r}
+cases <- expand.grid(so=1:5, years=c(2,5,10,20,30), threads=1:6)
+#cases <- cases[nrow(cases):1,]
+
+benchmarkRun <- function(i, reps=10L) { 
+  calibragem::forceMemoryCollection() # reduce the risk of interference of blocking garbage collection - cleans the slates in both R and .NET GC, and consequently SWIFT C++.
+  runAndTag(cases[i,], reps) 
+}
+```
+
+
+```{r}
+
+resultsFile <- 'f:/STSF/hwrs.RData'
+if(file.exists(resultsFile)) {
+  load(resultsFile)
+} else {
+  s <- now()
+  measures <- lapply( 1:nrow(cases), benchmarkRun )
+  e <- now()
+  e-s
+  measures <- rbind_all(measures)
+}
+measures
+measures$nlinks <- numLinks(measures$streamOrder)
+```
+
+Define a column rt as the length runtime per simulation year and per sub-area in the sytstem. This is needed to compare "apple with apple". Note that the number of threads need not be included, as the method to assess multi-threading already returns a comparable measure.
+
+```{r}
+measures$rt = measures$deltaT / (measures$years * measures$nlinks)
+```
+
+Let's see if we can resonably use the median of each 10 replicate measure for each case:
+
+```{r}
+by_cat <- group_by(measures, nlinks, nthreads, years)
+
+tmp <- summarise(by_cat, cv = sd(deltaT) / median(deltaT))
+summary(tmp$cv)
+```
+
+Most coefficients of variations are less than a percent. Let's define a performance measure perf by standardizing against the case with the smallest 'rt'
+
+```{r}
+m <- summarise(by_cat, rt=median(rt), deltaT=median(deltaT))
+m$perf = min(m$rt)/m$rt
+m$years.simul = factor(m$years)
+
+p <- ggplot(m, aes(x = nthreads, y = perf, colour=years.simul))
+#p <- ggplot(m, aes(x = nthreads, y = perf))
+p <- p + geom_point()
+p <- p + facet_grid(. ~ nlinks, scales = "free")
+#p <- p + facet_grid(years ~ nlinks, scales = "free")
+p + labs (title = "Relative speed performance, facet by number of subcatchments", y="Speed performance" ,
+   x = "number of threads", colour = "Simul. years")
+```
+
+This plot is rich in information.
+* The system scales well with multiple threads, for a given model size and length of simulation.
+* The system scales well with increasing system size. A drop in performance with system size is expected, typically because memory cache misses are more likely than with smaller models.
+
+```{r}
+sOrder <- 4
+cases <- expand.grid(so=sOrder, years=c(1:9,10,15,20,25,30,35,40,45,50,55,60), threads=1)
+if(!file.exists(resultsFile)) {
+  s <- now()
+  mSimlength <- lapply( 1:nrow(cases), benchmarkRun )
+  e <- now()
+  e-s
+  mSimlength <- rbind_all(mSimlength)
+  save(measures, mSimlength, file=resultsFile)
+}
+mSimlength$nlinks <- numLinks(mSimlength$streamOrder)
+
+
+by_cat <- group_by(mSimlength, nlinks, nthreads, years)
+tmp <- summarise(by_cat, cv = sd(deltaT) / median(deltaT))
+summary(tmp$cv)
+
+m <- summarise(by_cat, deltaT=median(deltaT))
+m$rtPerYear = m$deltaT / m$years
+
+p <- ggplot(m, aes(x = years, y=rtPerYear))
+p <- p + geom_point()
+p + labs (title = paste0("Runtime per simulation year, subareas= ", numLinks(sOrder)), y="Runtime per simulation year (ms)" ,
+   x = "Number of simulation years")
+```
+
+
+```{r, eval=FALSE, include=FALSE}
+
+nReps <- 10L
+
+
 cpSimul <- function(s) {
   return(clrCall(s, 'CloneModel'))
 }
-```
-# Assess the impact of adding input time series and output time series.
-```{r}
+getMeanTime <- function(mbench) {
+  m <- as.data.frame(mbench)
+  m_g <- group_by(m, expr)
+  summarise(m_g, time = mean(time, na.rm = TRUE))
+}
+
 
 baseline <- mkModel(3) 
 
@@ -152,47 +324,6 @@ f <- function(i) {execSimulation(systems[[i]])}
 
 # mb <- microbenchmark(f(1), f(2), f(3), f(4), f(5), times=nReps, control = list(order='block'))
 # plot(mb, ylab = 'time (ns)')
-
-getMeanTime <- function(mbench) {
-  m <- as.data.frame(mbench)
-  m_g <- group_by(m, expr)
-  summarise(m_g, time = mean(time, na.rm = TRUE))
-}
-
-
-mkTypical <- function(streamOrder, years=10, tstep='hourly') {
-  sim <- mkModel(streamOrder) 
-  sIds <- getSubareaIds(sim)
-  simulStart <- '2000-01-01'
-  simulEnd <- paste0(2000+years-1, '-12-31')
-  sSpan <- paste0('2000-01-01/',2000+years-1, '-12-31')
-  rain <- rain[sSpan]
-  evap <- evap[sSpan]
-  for (s in sIds) {
-    playSubareaInput(sim, input=rain, s, 'Rainfall')
-    playSubareaInput(sim, input=evap, s, 'Evapotranspiration')
-  }
-  setSimulationSpan(sim, start(rain), end(rain))
-  setSimulationTimeStep(sim, tstep)
-  recordState(sim, 'Catchment.StreamflowRate')
-  return(sim)
-}
-
-clrLoadAssembly('f:/src/github_jm/hwrs2015/ParallelSwift/bin/Debug/ParallelSwift.dll')
-
-runParallel <- function(simulation, nthreads=1L, reps=1L) {
-	return(clrCallStatic('ParallelSwift.SwiftRunTests', 'ParallelRun', simulation, nthreads, reps))
-}
-		
-runCase <- function(streamOrder, years=10L, nthreads=1L, reps=1L) {
-  s <- mkTypical(streamOrder, years)
-  runParallel(s, nthreads=nthreads, reps=reps)
-}
-
-runCase(streamOrder=3L, years=10L, nthreads=1L, reps=1L)
-
-
-
 
 
 systems <- lapply( 1:4, function(i) { mkTypical(i) } )
