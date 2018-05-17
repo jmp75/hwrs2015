@@ -257,6 +257,17 @@ This plot is rich in information.
 * The system scales well with multiple threads, for a given model size and length of simulation.
 * The system scales well with increasing system size. A drop in performance with system size is expected, typically because memory cache misses are more likely than with smaller models.
 
+Let's look at scaling for a subset of the data (for the HWRS paper)
+
+```{r}
+q <- (m %>% filter(nlinks==30.0) %>% filter(years==30))
+q$perf = min(q$rt)/q$rt
+p <- ggplot(q, aes(x = nthreads, y = perf))
+p <- p + geom_point()
+p + labs (title = "Parallel scaling", y="Speed performance (real/measured)" ,
+   x = "number of threads")
+```
+
 ```{r}
 sOrder <- 4
 cases <- expand.grid(so=sOrder, years=c(1:9,10,15,20,25,30,35,40,45,50,55,60), threads=1)
