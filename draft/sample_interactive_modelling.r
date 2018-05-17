@@ -65,3 +65,68 @@ plotParamEvolution <- function(logMh, paramName, objLims=NULL, title="Evolution 
 
 ## ------------------------------------------------------------------------
 print(plotParamEvolution(geomOps, pVarIds[1], objLims=c(0,1)))
+
+
+####################################
+## More concise sample code for screen capture
+
+library(calibragem); library(ophct)
+data('swift_sample_data')
+ms <- createSubareaSimulation(dataId='MMH', '1990-01-01',
+   '2005-12-31', 'GR4J', 'daily', 'P', 'E')
+runoffId <- 'subarea.Subarea.runoff'
+recordState(ms, runoffId)
+obsRunoff <- sampleSeries('MMH', 'flow') 
+s <- start(obsRunoff); e <- end(obsRunoff)
+w <- s + years(2); setSimulationSpan(ms, s, e)
+objective <- createObjective(ms, runoffId, obsRunoff, 'NSE', w, e)
+
+
+pSpecGr4j <- getFreeParams('GR4J')
+setHyperCube(parameterizer, pSpecGr4j, TRUE)
+parameterizer <- wrapTransform(parameterizer)
+addTransform(parameterizer, 'asinh_x2', 'x2', 'asinh')
+
+
+
+library(swift)
+runoffModel='GR4J'
+
+nodeIds=paste0('n', 1:6)
+linkIds = paste0('lnk', 1:5)
+defn <- list(
+	nodeIds=nodeIds,
+	nodeNames = paste0(nodeIds, '_name'),
+	linkIds=linkIds,
+	linkNames = paste0(linkIds, '_name'),
+	fromNode = paste0('n', c(2,5,4,3,1)),
+	toNode = paste0('n', c(6,2,2,4,4)),
+	areasKm2 = c(1.2, 2.3, 4.4, 2.2, 1.5),
+	runoffModel = runoffModel
+)
+simulation <- createCatchment(defn$nodeIds, defn$nodeNames, defn$linkIds, defn$linkNames, defn$fromNode, defn$toNode, defn$runoffModel, defn$areasKm2)
+
+evapIds <- paste( 'subarea', getSubareaIds(simulation), 'E', sep='.')
+dataLibrary <- uchronia::getEnsembleDataSet('f:/tmp/blah.yaml')
+playInputs(simulation, dataLibrary, precipIds, rep('rain_obs', length(precipIds)))
+playInputs(simulation, dataLibrary, evapIds, rep('pet_obs', length(evapIds)), 'daily_to_hourly')
+
+recordState(simulation, 'Catchment.StreamflowRate')
+
+snapshot <- snapshotState(simulation)
+snapshot$time
+snapshot$states
+
+simulation <- loadSimulation('f:/swift/sample/south_esk.json')
+dataLibrary <- uchronia::getEnsembleDataSet('f:/swift/sample/fcast.yaml')
+precipIds <- paste( 'subarea', getSubareaIds(simulation), 'P', sep='.')
+inputMap <- list(rain_fcast_ens=precipIds)
+ems <- createEnsembleForecastSimulation(simulation, dataLibrary, 
+      '2003-01-01', '2003-01-03', inputMap, leadTime=10)
+execSimulation(ems)
+
+
+
+
+
+
